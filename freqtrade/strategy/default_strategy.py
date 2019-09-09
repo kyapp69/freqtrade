@@ -2,11 +2,10 @@
 
 import talib.abstract as ta
 from pandas import DataFrame
+
 import freqtrade.vendor.qtpylib.indicators as qtpylib
+from freqtrade.indicator_helpers import fishers_inverse
 from freqtrade.strategy.interface import IStrategy
-
-
-class_name = 'DefaultStrategy'
 
 
 class DefaultStrategy(IStrategy):
@@ -14,28 +13,59 @@ class DefaultStrategy(IStrategy):
     Default Strategy provided by freqtrade bot.
     You can override it with your own strategy
     """
+    INTERFACE_VERSION = 2
 
     # Minimal ROI designed for the strategy
     minimal_roi = {
-        "40":  0.0,
-        "30":  0.01,
-        "20":  0.02,
-        "0":  0.04
+        "40": 0.0,
+        "30": 0.01,
+        "20": 0.02,
+        "0": 0.04
     }
 
     # Optimal stoploss designed for the strategy
     stoploss = -0.10
 
     # Optimal ticker interval for the strategy
-    ticker_interval = 5
+    ticker_interval = '5m'
 
-    def populate_indicators(self, dataframe: DataFrame) -> DataFrame:
+    # Optional order type mapping
+    order_types = {
+        'buy': 'limit',
+        'sell': 'limit',
+        'stoploss': 'limit',
+        'stoploss_on_exchange': False
+    }
+
+    # Optional time in force for orders
+    order_time_in_force = {
+        'buy': 'gtc',
+        'sell': 'gtc',
+    }
+
+    def informative_pairs(self):
+        """
+        Define additional, informative pair/interval combinations to be cached from the exchange.
+        These pair/interval combinations are non-tradeable, unless they are part
+        of the whitelist as well.
+        For more information, please consult the documentation
+        :return: List of tuples in the format (pair, interval)
+            Sample: return [("ETH/USDT", "5m"),
+                            ("BTC/USDT", "15m"),
+                            ]
+        """
+        return []
+
+    def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         """
         Adds several different TA indicators to the given DataFrame
 
         Performance Note: For the best performance be frugal on the number of indicators
         you are using. Let uncomment only the indicator you are using in your strategies
         or your hyperopt configuration, otherwise you will waste your memory and CPU usage.
+        :param dataframe: Raw data from the exchange and parsed by parse_ticker_dataframe()
+        :param metadata: Additional information, like the currently traded pair
+        :return: a Dataframe with all mandatory indicators for the strategies
         """
 
         # Momentum Indicator
@@ -74,17 +104,18 @@ class DefaultStrategy(IStrategy):
         """
         # RSI
         dataframe['rsi'] = ta.RSI(dataframe)
-        """
+
         # Inverse Fisher transform on RSI, values [-1.0, 1.0] (https://goo.gl/2JGGoy)
-        rsi = 0.1 * (dataframe['rsi'] - 50)
-        dataframe['fisher_rsi'] = (numpy.exp(2 * rsi) - 1) / (numpy.exp(2 * rsi) + 1)
+        dataframe['fisher_rsi'] = fishers_inverse(dataframe['rsi'])
+
         # Inverse Fisher transform on RSI normalized, value [0.0, 100.0] (https://goo.gl/2JGGoy)
         dataframe['fisher_rsi_norma'] = 50 * (dataframe['fisher_rsi'] + 1)
+
         # Stoch
         stoch = ta.STOCH(dataframe)
         dataframe['slowd'] = stoch['slowd']
         dataframe['slowk'] = stoch['slowk']
-        """
+
         # Stoch fast
         stoch_fast = ta.STOCHF(dataframe)
         dataframe['fastd'] = stoch_fast['fastd']
@@ -196,10 +227,11 @@ class DefaultStrategy(IStrategy):
 
         return dataframe
 
-    def populate_buy_trend(self, dataframe: DataFrame) -> DataFrame:
+    def populate_buy_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         """
         Based on TA indicators, populates the buy signal for the given dataframe
         :param dataframe: DataFrame
+        :param metadata: Additional information, like the currently traded pair
         :return: DataFrame with buy column
         """
         dataframe.loc[
@@ -217,10 +249,11 @@ class DefaultStrategy(IStrategy):
 
         return dataframe
 
-    def populate_sell_trend(self, dataframe: DataFrame) -> DataFrame:
+    def populate_sell_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         """
         Based on TA indicators, populates the sell signal for the given dataframe
         :param dataframe: DataFrame
+        :param metadata: Additional information, like the currently traded pair
         :return: DataFrame with buy column
         """
         dataframe.loc[

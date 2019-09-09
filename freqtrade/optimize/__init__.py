@@ -1,164 +1,101 @@
-# pragma pylint: disable=missing-docstring
-
 import logging
-import json
-import os
-from typing import Optional, List, Dict
-from pandas import DataFrame
-from freqtrade.exchange import get_ticker_history
-from freqtrade.analyze import populate_indicators, parse_ticker_dataframe
+from argparse import Namespace
+from typing import Any, Dict
 
-from freqtrade import misc
-from user_data.hyperopt_conf import hyperopt_optimize_conf
-import gzip
+from filelock import FileLock, Timeout
+
+from freqtrade import DependencyException, constants
+from freqtrade.state import RunMode
+from freqtrade.utils import setup_utils_configuration
+
 
 logger = logging.getLogger(__name__)
 
 
-def trim_tickerlist(tickerlist, timerange):
-    (stype, start, stop) = timerange
-    if stype == (None, 'line'):
-        return tickerlist[stop:]
-    elif stype == ('line', None):
-        return tickerlist[0:start]
-    elif stype == ('index', 'index'):
-        return tickerlist[start:stop]
-
-    return tickerlist
-
-
-def load_tickerdata_file(datadir, pair, ticker_interval, timerange=None):
+def setup_configuration(args: Namespace, method: RunMode) -> Dict[str, Any]:
     """
-    Load a pair from file,
-    :return dict OR empty if unsuccesful
+    Prepare the configuration for the Hyperopt module
+    :param args: Cli args from Arguments()
+    :return: Configuration
     """
-    path = make_testdata_path(datadir)
-    file = '{abspath}/{pair}-{ticker_interval}.json'.format(
-        abspath=path,
-        pair=pair,
-        ticker_interval=ticker_interval,
-    )
-    gzipfile = file + '.gz'
+    config = setup_utils_configuration(args, method)
 
-    # If the file does not exist we download it when None is returned.
-    # If file exists, read the file, load the json
-    if os.path.isfile(gzipfile):
-        with gzip.open(gzipfile) as tickerdata:
-            pairdata = json.load(tickerdata)
-    elif os.path.isfile(file):
-        with open(file) as tickerdata:
-            pairdata = json.load(tickerdata)
-    else:
-        return None
+    if method == RunMode.BACKTEST:
+        if config['stake_amount'] == constants.UNLIMITED_STAKE_AMOUNT:
+            raise DependencyException('stake amount could not be "%s" for backtesting' %
+                                      constants.UNLIMITED_STAKE_AMOUNT)
 
-    if timerange:
-        pairdata = trim_tickerlist(pairdata, timerange)
-    return pairdata
+    return config
 
 
-def load_data(datadir: str, ticker_interval: int, pairs: Optional[List[str]] = None,
-              refresh_pairs: Optional[bool] = False, timerange=None) -> Dict[str, List]:
+def start_backtesting(args: Namespace) -> None:
     """
-    Loads ticker history data for the given parameters
-    :param ticker_interval: ticker interval in minutes
-    :param pairs: list of pairs
-    :return: dict
+    Start Backtesting script
+    :param args: Cli args from Arguments()
+    :return: None
     """
-    result = {}
+    # Import here to avoid loading backtesting module when it's not used
+    from freqtrade.optimize.backtesting import Backtesting
 
-    _pairs = pairs or hyperopt_optimize_conf()['exchange']['pair_whitelist']
+    # Initialize configuration
+    config = setup_configuration(args, RunMode.BACKTEST)
 
-    # If the user force the refresh of pairs
-    if refresh_pairs:
-        logger.info('Download data for all pairs and store them in %s', datadir)
-        download_pairs(datadir, _pairs, ticker_interval)
+    logger.info('Starting freqtrade in Backtesting mode')
 
-    for pair in _pairs:
-        pairdata = load_tickerdata_file(datadir, pair, ticker_interval, timerange=timerange)
-        if not pairdata:
-            # download the tickerdata from exchange
-            download_backtesting_testdata(datadir, pair=pair, interval=ticker_interval)
-            # and retry reading the pair
-            pairdata = load_tickerdata_file(datadir, pair, ticker_interval, timerange=timerange)
-        result[pair] = pairdata
-    return result
+    # Initialize backtesting object
+    backtesting = Backtesting(config)
+    backtesting.start()
 
 
-def tickerdata_to_dataframe(data):
-    preprocessed = preprocess(data)
-    return preprocessed
-
-
-def preprocess(tickerdata: Dict[str, List]) -> Dict[str, DataFrame]:
-    """Creates a dataframe and populates indicators for given ticker data"""
-    return {pair: populate_indicators(parse_ticker_dataframe(pair_data))
-            for pair, pair_data in tickerdata.items()}
-
-
-def make_testdata_path(datadir: str) -> str:
-    """Return the path where testdata files are stored"""
-    return datadir or os.path.abspath(os.path.join(os.path.dirname(__file__),
-                                                   '..', 'tests', 'testdata'))
-
-
-def download_pairs(datadir, pairs: List[str], ticker_interval: int) -> bool:
-    """For each pairs passed in parameters, download the ticker intervals"""
-    for pair in pairs:
-        try:
-            download_backtesting_testdata(datadir, pair=pair, interval=ticker_interval)
-        except BaseException:
-            logger.info('Failed to download the pair: "{pair}", Interval: {interval} min'.format(
-                pair=pair,
-                interval=ticker_interval,
-            ))
-            return False
-    return True
-
-
-def file_dump_json(filename, data):
-    with open(filename, "wt") as fp:
-        json.dump(data, fp)
-
-
-# FIX: 20180110, suggest rename interval to tick_interval
-def download_backtesting_testdata(datadir: str, pair: str, interval: int = 5) -> bool:
+def start_hyperopt(args: Namespace) -> None:
     """
-    Download the latest 1 and 5 ticker intervals from Bittrex for the pairs passed in parameters
-    Based on @Rybolov work: https://github.com/rybolov/freqtrade-data
-    :param pairs: list of pairs to download
-    :return: bool
+    Start hyperopt script
+    :param args: Cli args from Arguments()
+    :return: None
     """
+    # Import here to avoid loading hyperopt module when it's not used
+    from freqtrade.optimize.hyperopt import Hyperopt
 
-    path = make_testdata_path(datadir)
-    logger.info('Download the pair: "{pair}", Interval: {interval} min'.format(
-        pair=pair,
-        interval=interval,
-    ))
+    # Initialize configuration
+    config = setup_configuration(args, RunMode.HYPEROPT)
 
-    filepair = pair.replace("-", "_")
-    filename = os.path.join(path, '{pair}-{interval}.json'.format(
-        pair=filepair,
-        interval=interval,
-    ))
+    logger.info('Starting freqtrade in Hyperopt mode')
 
-    if os.path.isfile(filename):
-        with open(filename, "rt") as fp:
-            data = json.load(fp)
-        logger.debug("Current Start: {}".format(data[1]['T']))
-        logger.debug("Current End: {}".format(data[-1:][0]['T']))
-    else:
-        data = []
-        logger.debug("Current Start: None")
-        logger.debug("Current End: None")
+    lock = FileLock(Hyperopt.get_lock_filename(config))
 
-    new_data = get_ticker_history(pair=pair, tick_interval=int(interval))
-    for row in new_data:
-        if row not in data:
-            data.append(row)
-    logger.debug("New Start: {}".format(data[1]['T']))
-    logger.debug("New End: {}".format(data[-1:][0]['T']))
-    data = sorted(data, key=lambda data: data['T'])
+    try:
+        with lock.acquire(timeout=1):
 
-    misc.file_dump_json(filename, data)
+            # Remove noisy log messages
+            logging.getLogger('hyperopt.tpe').setLevel(logging.WARNING)
+            logging.getLogger('filelock').setLevel(logging.WARNING)
 
-    return True
+            # Initialize backtesting object
+            hyperopt = Hyperopt(config)
+            hyperopt.start()
+
+    except Timeout:
+        logger.info("Another running instance of freqtrade Hyperopt detected.")
+        logger.info("Simultaneous execution of multiple Hyperopt commands is not supported. "
+                    "Hyperopt module is resource hungry. Please run your Hyperopts sequentially "
+                    "or on separate machines.")
+        logger.info("Quitting now.")
+        # TODO: return False here in order to help freqtrade to exit
+        # with non-zero exit code...
+        # Same in Edge and Backtesting start() functions.
+
+
+def start_edge(args: Namespace) -> None:
+    """
+    Start Edge script
+    :param args: Cli args from Arguments()
+    :return: None
+    """
+    from freqtrade.optimize.edge_cli import EdgeCli
+    # Initialize configuration
+    config = setup_configuration(args, RunMode.EDGE)
+    logger.info('Starting freqtrade in Edge mode')
+
+    # Initialize Edge object
+    edge_cli = EdgeCli(config)
+    edge_cli.start()

@@ -1,436 +1,612 @@
+# pragma pylint: disable=unused-argument, unused-variable, protected-access, invalid-name
+
+"""
+This module manage Telegram communication
+"""
 import logging
-from typing import Any, Callable
+from typing import Any, Callable, Dict
 
 from tabulate import tabulate
-from telegram import Bot, ParseMode, ReplyKeyboardMarkup, Update
+from telegram import ParseMode, ReplyKeyboardMarkup, Update
 from telegram.error import NetworkError, TelegramError
-from telegram.ext import CommandHandler, Updater
+from telegram.ext import CommandHandler, Updater, CallbackContext
 
-from freqtrade.rpc.__init__ import (rpc_status_table,
-                                    rpc_trade_status,
-                                    rpc_daily_profit,
-                                    rpc_trade_statistics,
-                                    rpc_balance,
-                                    rpc_start,
-                                    rpc_stop,
-                                    rpc_forcesell,
-                                    rpc_performance,
-                                    rpc_count,
-                                    )
+from freqtrade.__init__ import __version__
+from freqtrade.rpc import RPC, RPCException, RPCMessageType
+from freqtrade.rpc.fiat_convert import CryptoToFiatConverter
 
-from freqtrade import __version__
-
-
-# Remove noisy log messages
-logging.getLogger('requests.packages.urllib3').setLevel(logging.INFO)
-logging.getLogger('telegram').setLevel(logging.INFO)
 logger = logging.getLogger(__name__)
 
-_UPDATER: Updater = None
-_CONF = {}
+logger.debug('Included module rpc.telegram ...')
 
 
-def init(config: dict) -> None:
-    """
-    Initializes this module with the given config,
-    registers all known command handlers
-    and starts polling for message updates
-    :param config: config to use
-    :return: None
-    """
-    global _UPDATER
-
-    _CONF.update(config)
-    if not is_enabled():
-        return
-
-    _UPDATER = Updater(token=config['telegram']['token'], workers=0)
-
-    # Register command handler and start telegram message polling
-    handles = [
-        CommandHandler('status', _status),
-        CommandHandler('profit', _profit),
-        CommandHandler('balance', _balance),
-        CommandHandler('start', _start),
-        CommandHandler('stop', _stop),
-        CommandHandler('forcesell', _forcesell),
-        CommandHandler('performance', _performance),
-        CommandHandler('daily', _daily),
-        CommandHandler('count', _count),
-        CommandHandler('help', _help),
-        CommandHandler('version', _version),
-    ]
-    for handle in handles:
-        _UPDATER.dispatcher.add_handler(handle)
-    _UPDATER.start_polling(
-        clean=True,
-        bootstrap_retries=-1,
-        timeout=30,
-        read_latency=60,
-    )
-    logger.info(
-        'rpc.telegram is listening for following commands: %s',
-        [h.command for h in handles]
-    )
+MAX_TELEGRAM_MESSAGE_LENGTH = 4096
 
 
-def cleanup() -> None:
-    """
-    Stops all running telegram threads.
-    :return: None
-    """
-    if not is_enabled():
-        return
-    _UPDATER.stop()
-
-
-def is_enabled() -> bool:
-    """
-    Returns True if the telegram module is activated, False otherwise
-    """
-    return bool(_CONF['telegram'].get('enabled', False))
-
-
-def authorized_only(command_handler: Callable[[Bot, Update], None]) -> Callable[..., Any]:
+def authorized_only(command_handler: Callable[..., None]) -> Callable[..., Any]:
     """
     Decorator to check if the message comes from the correct chat_id
     :param command_handler: Telegram CommandHandler
     :return: decorated function
     """
-    def wrapper(*args, **kwargs):
-        update = kwargs.get('update') or args[1]
+    def wrapper(self, *args, **kwargs):
+        """ Decorator logic """
+        update = kwargs.get('update') or args[0]
 
         # Reject unauthorized messages
-        chat_id = int(_CONF['telegram']['chat_id'])
+        chat_id = int(self._config['telegram']['chat_id'])
+
         if int(update.message.chat_id) != chat_id:
-            logger.info('Rejected unauthorized message from: %s', update.message.chat_id)
+            logger.info(
+                'Rejected unauthorized message from: %s',
+                update.message.chat_id
+            )
             return wrapper
 
-        logger.info('Executing handler: %s for chat_id: %s', command_handler.__name__, chat_id)
+        logger.info(
+            'Executing handler: %s for chat_id: %s',
+            command_handler.__name__,
+            chat_id
+        )
         try:
-            return command_handler(*args, **kwargs)
+            return command_handler(self, *args, **kwargs)
         except BaseException:
             logger.exception('Exception occurred within Telegram module')
+
     return wrapper
 
 
-@authorized_only
-def _status(bot: Bot, update: Update) -> None:
-    """
-    Handler for /status.
-    Returns the current TradeThread status
-    :param bot: telegram bot
-    :param update: message update
-    :return: None
-    """
+class Telegram(RPC):
+    """  This class handles all telegram communication """
 
-    # Check if additional parameters are passed
-    params = update.message.text.replace('/status', '').split(' ') \
-        if update.message.text else []
-    if 'table' in params:
-        _status_table(bot, update)
-        return
+    def __init__(self, freqtrade) -> None:
+        """
+        Init the Telegram call, and init the super class RPC
+        :param freqtrade: Instance of a freqtrade bot
+        :return: None
+        """
+        super().__init__(freqtrade)
 
-    # Fetch open trade
-    (error, trades) = rpc_trade_status()
-    if error:
-        send_msg(trades, bot=bot)
-    else:
-        for trademsg in trades:
-            send_msg(trademsg, bot=bot)
+        self._updater: Updater = None
+        self._config = freqtrade.config
+        self._init()
+        if self._config.get('fiat_display_currency', None):
+            self._fiat_converter = CryptoToFiatConverter()
 
+    def _init(self) -> None:
+        """
+        Initializes this module with the given config,
+        registers all known command handlers
+        and starts polling for message updates
+        """
+        self._updater = Updater(token=self._config['telegram']['token'], workers=0,
+                                use_context=True)
 
-@authorized_only
-def _status_table(bot: Bot, update: Update) -> None:
-    """
-    Handler for /status table.
-    Returns the current TradeThread status in table format
-    :param bot: telegram bot
-    :param update: message update
-    :return: None
-    """
-    # Fetch open trade
-    (err, df_statuses) = rpc_status_table()
-    if err:
-        send_msg(df_statuses, bot=bot)
-    else:
-        message = tabulate(df_statuses, headers='keys', tablefmt='simple')
-        message = "<pre>{}</pre>".format(message)
+        # Register command handler and start telegram message polling
+        handles = [
+            CommandHandler('status', self._status),
+            CommandHandler('profit', self._profit),
+            CommandHandler('balance', self._balance),
+            CommandHandler('start', self._start),
+            CommandHandler('stop', self._stop),
+            CommandHandler('forcesell', self._forcesell),
+            CommandHandler('forcebuy', self._forcebuy),
+            CommandHandler('performance', self._performance),
+            CommandHandler('daily', self._daily),
+            CommandHandler('count', self._count),
+            CommandHandler('reload_conf', self._reload_conf),
+            CommandHandler('stopbuy', self._stopbuy),
+            CommandHandler('whitelist', self._whitelist),
+            CommandHandler('blacklist', self._blacklist),
+            CommandHandler('edge', self._edge),
+            CommandHandler('help', self._help),
+            CommandHandler('version', self._version),
+        ]
+        for handle in handles:
+            self._updater.dispatcher.add_handler(handle)
+        self._updater.start_polling(
+            clean=True,
+            bootstrap_retries=-1,
+            timeout=30,
+            read_latency=60,
+        )
+        logger.info(
+            'rpc.telegram is listening for following commands: %s',
+            [h.command for h in handles]
+        )
 
-        send_msg(message, parse_mode=ParseMode.HTML)
+    def cleanup(self) -> None:
+        """
+        Stops all running telegram threads.
+        :return: None
+        """
+        self._updater.stop()
 
+    def send_msg(self, msg: Dict[str, Any]) -> None:
+        """ Send a message to telegram channel """
 
-@authorized_only
-def _daily(bot: Bot, update: Update) -> None:
-    """
-    Handler for /daily <n>
-    Returns a daily profit (in BTC) over the last n days.
-    :param bot: telegram bot
-    :param update: message update
-    :return: None
-    """
-    try:
-        timescale = int(update.message.text.replace('/daily', '').strip())
-    except (TypeError, ValueError):
-        timescale = 7
-    (error, stats) = rpc_daily_profit(timescale,
-                                      _CONF['stake_currency'],
-                                      _CONF['fiat_display_currency'])
-    if error:
-        send_msg(stats, bot=bot)
-    else:
-        stats = tabulate(stats,
-                         headers=[
-                             'Day',
-                             'Profit {}'.format(_CONF['stake_currency']),
-                             'Profit {}'.format(_CONF['fiat_display_currency'])
-                         ],
-                         tablefmt='simple')
-        message = '<b>Daily Profit over the last {} days</b>:\n<pre>{}</pre>'.format(
-                  timescale, stats)
-        send_msg(message, bot=bot, parse_mode=ParseMode.HTML)
+        if msg['type'] == RPCMessageType.BUY_NOTIFICATION:
+            if self._fiat_converter:
+                msg['stake_amount_fiat'] = self._fiat_converter.convert_amount(
+                    msg['stake_amount'], msg['stake_currency'], msg['fiat_currency'])
+            else:
+                msg['stake_amount_fiat'] = 0
 
+            message = ("*{exchange}:* Buying {pair}\n"
+                       "at rate `{limit:.8f}\n"
+                       "({stake_amount:.6f} {stake_currency}").format(**msg)
 
-@authorized_only
-def _profit(bot: Bot, update: Update) -> None:
-    """
-    Handler for /profit.
-    Returns a cumulative profit statistics.
-    :param bot: telegram bot
-    :param update: message update
-    :return: None
-    """
-    (error, stats) = rpc_trade_statistics(_CONF['stake_currency'],
-                                          _CONF['fiat_display_currency'])
-    if error:
-        send_msg(stats, bot=bot)
-        return
+            if msg.get('fiat_currency', None):
+                message += ",{stake_amount_fiat:.3f} {fiat_currency}".format(**msg)
+            message += ")`"
 
-    # Message to display
-    markdown_msg = """
-*ROI:* Close trades
-  ∙ `{profit_closed_coin:.8f} {coin} ({profit_closed_percent:.2f}%)`
-  ∙ `{profit_closed_fiat:.3f} {fiat}`
-*ROI:* All trades
-  ∙ `{profit_all_coin:.8f} {coin} ({profit_all_percent:.2f}%)`
-  ∙ `{profit_all_fiat:.3f} {fiat}`
+        elif msg['type'] == RPCMessageType.SELL_NOTIFICATION:
+            msg['amount'] = round(msg['amount'], 8)
+            msg['profit_percent'] = round(msg['profit_percent'] * 100, 2)
 
-*Total Trade Count:* `{trade_count}`
-*First Trade opened:* `{first_trade_date}`
-*Latest Trade opened:* `{latest_trade_date}`
-*Avg. Duration:* `{avg_duration}`
-*Best Performing:* `{best_pair}: {best_rate:.2f}%`
-    """.format(
-        coin=_CONF['stake_currency'],
-        fiat=_CONF['fiat_display_currency'],
-        profit_closed_coin=stats['profit_closed_coin'],
-        profit_closed_percent=stats['profit_closed_percent'],
-        profit_closed_fiat=stats['profit_closed_fiat'],
-        profit_all_coin=stats['profit_all_coin'],
-        profit_all_percent=stats['profit_all_percent'],
-        profit_all_fiat=stats['profit_all_fiat'],
-        trade_count=stats['trade_count'],
-        first_trade_date=stats['first_trade_date'],
-        latest_trade_date=stats['latest_trade_date'],
-        avg_duration=stats['avg_duration'],
-        best_pair=stats['best_pair'],
-        best_rate=stats['best_rate']
-    )
-    send_msg(markdown_msg, bot=bot)
+            message = ("*{exchange}:* Selling {pair}\n"
+                       "*Rate:* `{limit:.8f}`\n"
+                       "*Amount:* `{amount:.8f}`\n"
+                       "*Open Rate:* `{open_rate:.8f}`\n"
+                       "*Current Rate:* `{current_rate:.8f}`\n"
+                       "*Sell Reason:* `{sell_reason}`\n"
+                       "*Profit:* `{profit_percent:.2f}%`").format(**msg)
 
+            # Check if all sell properties are available.
+            # This might not be the case if the message origin is triggered by /forcesell
+            if (all(prop in msg for prop in ['gain', 'fiat_currency', 'stake_currency'])
+               and self._fiat_converter):
+                msg['profit_fiat'] = self._fiat_converter.convert_amount(
+                    msg['profit_amount'], msg['stake_currency'], msg['fiat_currency'])
+                message += ('` ({gain}: {profit_amount:.8f} {stake_currency}`'
+                            '` / {profit_fiat:.3f} {fiat_currency})`').format(**msg)
 
-@authorized_only
-def _balance(bot: Bot, update: Update) -> None:
-    """
-    Handler for /balance
-    """
-    (error, result) = rpc_balance(_CONF['fiat_display_currency'])
-    if error:
-        send_msg('`All balances are zero.`')
-        return
+        elif msg['type'] == RPCMessageType.STATUS_NOTIFICATION:
+            message = '*Status:* `{status}`'.format(**msg)
 
-    (currencys, total, symbol, value) = result
-    output = ''
-    for currency in currencys:
-        output += """*Currency*: {currency}
-*Available*: {available}
-*Balance*: {balance}
-*Pending*: {pending}
-*Est. BTC*: {est_btc: .8f}
-""".format(**currency)
+        elif msg['type'] == RPCMessageType.WARNING_NOTIFICATION:
+            message = '*Warning:* `{status}`'.format(**msg)
 
-    output += """*Estimated Value*:
-*BTC*: {0: .8f}
-*{1}*: {2: .2f}
-""".format(total, symbol, value)
-    send_msg(output)
+        elif msg['type'] == RPCMessageType.CUSTOM_NOTIFICATION:
+            message = '{status}'.format(**msg)
 
+        else:
+            raise NotImplementedError('Unknown message type: {}'.format(msg['type']))
 
-@authorized_only
-def _start(bot: Bot, update: Update) -> None:
-    """
-    Handler for /start.
-    Starts TradeThread
-    :param bot: telegram bot
-    :param update: message update
-    :return: None
-    """
-    (error, msg) = rpc_start()
-    if error:
-        send_msg(msg, bot=bot)
+        self._send_msg(message)
 
+    @authorized_only
+    def _status(self, update: Update, context: CallbackContext) -> None:
+        """
+        Handler for /status.
+        Returns the current TradeThread status
+        :param bot: telegram bot
+        :param update: message update
+        :return: None
+        """
 
-@authorized_only
-def _stop(bot: Bot, update: Update) -> None:
-    """
-    Handler for /stop.
-    Stops TradeThread
-    :param bot: telegram bot
-    :param update: message update
-    :return: None
-    """
-    (error, msg) = rpc_stop()
-    send_msg(msg, bot=bot)
+        if 'table' in context.args:
+            self._status_table(update, context)
+            return
 
-
-# FIX: no test for this!!!!
-@authorized_only
-def _forcesell(bot: Bot, update: Update) -> None:
-    """
-    Handler for /forcesell <id>.
-    Sells the given trade at current price
-    :param bot: telegram bot
-    :param update: message update
-    :return: None
-    """
-
-    trade_id = update.message.text.replace('/forcesell', '').strip()
-    (error, message) = rpc_forcesell(trade_id)
-    if error:
-        send_msg(message, bot=bot)
-        return
-
-
-@authorized_only
-def _performance(bot: Bot, update: Update) -> None:
-    """
-    Handler for /performance.
-    Shows a performance statistic from finished trades
-    :param bot: telegram bot
-    :param update: message update
-    :return: None
-    """
-    (error, trades) = rpc_performance()
-    if error:
-        send_msg(trades, bot=bot)
-        return
-
-    stats = '\n'.join('{index}.\t<code>{pair}\t{profit:.2f}% ({count})</code>'.format(
-        index=i + 1,
-        pair=trade['pair'],
-        profit=trade['profit'],
-        count=trade['count']
-    ) for i, trade in enumerate(trades))
-    message = '<b>Performance:</b>\n{}'.format(stats)
-    send_msg(message, parse_mode=ParseMode.HTML)
-
-
-@authorized_only
-def _count(bot: Bot, update: Update) -> None:
-    """
-    Handler for /count.
-    Returns the number of trades running
-    :param bot: telegram bot
-    :param update: message update
-    :return: None
-    """
-    (error, trades) = rpc_count()
-    if error:
-        send_msg(trades, bot=bot)
-        return
-
-    message = tabulate({
-        'current': [len(trades)],
-        'max': [_CONF['max_open_trades']]
-    }, headers=['current', 'max'], tablefmt='simple')
-    message = "<pre>{}</pre>".format(message)
-    logger.debug(message)
-    send_msg(message, parse_mode=ParseMode.HTML)
-
-
-@authorized_only
-def _help(bot: Bot, update: Update) -> None:
-    """
-    Handler for /help.
-    Show commands of the bot
-    :param bot: telegram bot
-    :param update: message update
-    :return: None
-    """
-    message = """
-*/start:* `Starts the trader`
-*/stop:* `Stops the trader`
-*/status [table]:* `Lists all open trades`
-            *table :* `will display trades in a table`
-*/profit:* `Lists cumulative profit from all finished trades`
-*/forcesell <trade_id>|all:* `Instantly sells the given trade or all trades, regardless of profit`
-*/performance:* `Show performance of each finished trade grouped by pair`
-*/daily <n>:* `Shows profit or loss per day, over the last n days`
-*/count:* `Show number of trades running compared to allowed number of trades`
-*/balance:* `Show account balance per currency`
-*/help:* `This help message`
-*/version:* `Show version`
-    """
-    send_msg(message, bot=bot)
-
-
-@authorized_only
-def _version(bot: Bot, update: Update) -> None:
-    """
-    Handler for /version.
-    Show version information
-    :param bot: telegram bot
-    :param update: message update
-    :return: None
-    """
-    send_msg('*Version:* `{}`'.format(__version__), bot=bot)
-
-
-def send_msg(msg: str, bot: Bot = None, parse_mode: ParseMode = ParseMode.MARKDOWN) -> None:
-    """
-    Send given markdown message
-    :param msg: message
-    :param bot: alternative bot
-    :param parse_mode: telegram parse mode
-    :return: None
-    """
-    if not is_enabled():
-        return
-
-    bot = bot or _UPDATER.bot
-
-    keyboard = [['/daily', '/profit', '/balance'],
-                ['/status', '/status table', '/performance'],
-                ['/count', '/start', '/stop', '/help']]
-
-    reply_markup = ReplyKeyboardMarkup(keyboard)
-
-    try:
         try:
-            bot.send_message(
-                _CONF['telegram']['chat_id'], msg,
-                parse_mode=parse_mode, reply_markup=reply_markup
+            results = self._rpc_trade_status()
+
+            messages = []
+            for r in results:
+                lines = [
+                    "*Trade ID:* `{trade_id}` `(since {open_date_hum})`",
+                    "*Current Pair:* {pair}",
+                    "*Amount:* `{amount} ({stake_amount} {base_currency})`",
+                    "*Open Rate:* `{open_rate:.8f}`",
+                    "*Close Rate:* `{close_rate}`" if r['close_rate'] else "",
+                    "*Current Rate:* `{current_rate:.8f}`",
+                    "*Close Profit:* `{close_profit}`" if r['close_profit'] else "",
+                    "*Current Profit:* `{current_profit:.2f}%`",
+
+                    # Adding initial stoploss only if it is different from stoploss
+                    "*Initial Stoploss:* `{initial_stop_loss:.8f}` " +
+                    ("`({initial_stop_loss_pct:.2f}%)`" if r['initial_stop_loss_pct'] else "")
+                    if r['stop_loss'] != r['initial_stop_loss'] else "",
+
+                    # Adding stoploss and stoploss percentage only if it is not None
+                    "*Stoploss:* `{stop_loss:.8f}` " +
+                    ("`({stop_loss_pct:.2f}%)`" if r['stop_loss_pct'] else ""),
+
+                    "*Open Order:* `{open_order}`" if r['open_order'] else ""
+                ]
+                # Filter empty lines using list-comprehension
+                messages.append("\n".join([l for l in lines if l]).format(**r))
+
+            for msg in messages:
+                self._send_msg(msg)
+
+        except RPCException as e:
+            self._send_msg(str(e))
+
+    @authorized_only
+    def _status_table(self, update: Update, context: CallbackContext) -> None:
+        """
+        Handler for /status table.
+        Returns the current TradeThread status in table format
+        :param bot: telegram bot
+        :param update: message update
+        :return: None
+        """
+        try:
+            df_statuses = self._rpc_status_table()
+            message = tabulate(df_statuses, headers='keys', tablefmt='simple')
+            self._send_msg(f"<pre>{message}</pre>", parse_mode=ParseMode.HTML)
+        except RPCException as e:
+            self._send_msg(str(e))
+
+    @authorized_only
+    def _daily(self, update: Update, context: CallbackContext) -> None:
+        """
+        Handler for /daily <n>
+        Returns a daily profit (in BTC) over the last n days.
+        :param bot: telegram bot
+        :param update: message update
+        :return: None
+        """
+        stake_cur = self._config['stake_currency']
+        fiat_disp_cur = self._config.get('fiat_display_currency', '')
+        try:
+            timescale = int(context.args[0])
+        except (TypeError, ValueError, IndexError):
+            timescale = 7
+        try:
+            stats = self._rpc_daily_profit(
+                timescale,
+                stake_cur,
+                fiat_disp_cur
             )
-        except NetworkError as network_err:
-            # Sometimes the telegram server resets the current connection,
-            # if this is the case we send the message again.
+            stats_tab = tabulate(stats,
+                                 headers=[
+                                     'Day',
+                                     f'Profit {stake_cur}',
+                                     f'Profit {fiat_disp_cur}',
+                                     f'Trades'
+                                 ],
+                                 tablefmt='simple')
+            message = f'<b>Daily Profit over the last {timescale} days</b>:\n<pre>{stats_tab}</pre>'
+            self._send_msg(message, parse_mode=ParseMode.HTML)
+        except RPCException as e:
+            self._send_msg(str(e))
+
+    @authorized_only
+    def _profit(self, update: Update, context: CallbackContext) -> None:
+        """
+        Handler for /profit.
+        Returns a cumulative profit statistics.
+        :param bot: telegram bot
+        :param update: message update
+        :return: None
+        """
+        stake_cur = self._config['stake_currency']
+        fiat_disp_cur = self._config.get('fiat_display_currency', '')
+
+        try:
+            stats = self._rpc_trade_statistics(
+                stake_cur,
+                fiat_disp_cur)
+            profit_closed_coin = stats['profit_closed_coin']
+            profit_closed_percent = stats['profit_closed_percent']
+            profit_closed_fiat = stats['profit_closed_fiat']
+            profit_all_coin = stats['profit_all_coin']
+            profit_all_percent = stats['profit_all_percent']
+            profit_all_fiat = stats['profit_all_fiat']
+            trade_count = stats['trade_count']
+            first_trade_date = stats['first_trade_date']
+            latest_trade_date = stats['latest_trade_date']
+            avg_duration = stats['avg_duration']
+            best_pair = stats['best_pair']
+            best_rate = stats['best_rate']
+            # Message to display
+            markdown_msg = "*ROI:* Close trades\n" \
+                           f"∙ `{profit_closed_coin:.8f} {stake_cur} "\
+                           f"({profit_closed_percent:.2f}%)`\n" \
+                           f"∙ `{profit_closed_fiat:.3f} {fiat_disp_cur}`\n" \
+                           f"*ROI:* All trades\n" \
+                           f"∙ `{profit_all_coin:.8f} {stake_cur} ({profit_all_percent:.2f}%)`\n" \
+                           f"∙ `{profit_all_fiat:.3f} {fiat_disp_cur}`\n" \
+                           f"*Total Trade Count:* `{trade_count}`\n" \
+                           f"*First Trade opened:* `{first_trade_date}`\n" \
+                           f"*Latest Trade opened:* `{latest_trade_date}`\n" \
+                           f"*Avg. Duration:* `{avg_duration}`\n" \
+                           f"*Best Performing:* `{best_pair}: {best_rate:.2f}%`"
+            self._send_msg(markdown_msg)
+        except RPCException as e:
+            self._send_msg(str(e))
+
+    @authorized_only
+    def _balance(self, update: Update, context: CallbackContext) -> None:
+        """ Handler for /balance """
+        try:
+            result = self._rpc_balance(self._config.get('fiat_display_currency', ''))
+            output = ''
+            for currency in result['currencies']:
+                if currency['est_btc'] > 0.0001:
+                    curr_output = "*{currency}:*\n" \
+                            "\t`Available: {free: .8f}`\n" \
+                            "\t`Balance: {balance: .8f}`\n" \
+                            "\t`Pending: {used: .8f}`\n" \
+                            "\t`Est. BTC: {est_btc: .8f}`\n".format(**currency)
+                else:
+                    curr_output = "*{currency}:* not showing <1$ amount \n".format(**currency)
+
+                # Handle overflowing messsage length
+                if len(output + curr_output) >= MAX_TELEGRAM_MESSAGE_LENGTH:
+                    self._send_msg(output)
+                    output = curr_output
+                else:
+                    output += curr_output
+
+            output += "\n*Estimated Value*:\n" \
+                      "\t`BTC: {total: .8f}`\n" \
+                      "\t`{symbol}: {value: .2f}`\n".format(**result)
+            self._send_msg(output)
+        except RPCException as e:
+            self._send_msg(str(e))
+
+    @authorized_only
+    def _start(self, update: Update, context: CallbackContext) -> None:
+        """
+        Handler for /start.
+        Starts TradeThread
+        :param bot: telegram bot
+        :param update: message update
+        :return: None
+        """
+        msg = self._rpc_start()
+        self._send_msg('Status: `{status}`'.format(**msg))
+
+    @authorized_only
+    def _stop(self, update: Update, context: CallbackContext) -> None:
+        """
+        Handler for /stop.
+        Stops TradeThread
+        :param bot: telegram bot
+        :param update: message update
+        :return: None
+        """
+        msg = self._rpc_stop()
+        self._send_msg('Status: `{status}`'.format(**msg))
+
+    @authorized_only
+    def _reload_conf(self, update: Update, context: CallbackContext) -> None:
+        """
+        Handler for /reload_conf.
+        Triggers a config file reload
+        :param bot: telegram bot
+        :param update: message update
+        :return: None
+        """
+        msg = self._rpc_reload_conf()
+        self._send_msg('Status: `{status}`'.format(**msg))
+
+    @authorized_only
+    def _stopbuy(self, update: Update, context: CallbackContext) -> None:
+        """
+        Handler for /stop_buy.
+        Sets max_open_trades to 0 and gracefully sells all open trades
+        :param bot: telegram bot
+        :param update: message update
+        :return: None
+        """
+        msg = self._rpc_stopbuy()
+        self._send_msg('Status: `{status}`'.format(**msg))
+
+    @authorized_only
+    def _forcesell(self, update: Update, context: CallbackContext) -> None:
+        """
+        Handler for /forcesell <id>.
+        Sells the given trade at current price
+        :param bot: telegram bot
+        :param update: message update
+        :return: None
+        """
+
+        trade_id = context.args[0] if len(context.args) > 0 else None
+        try:
+            msg = self._rpc_forcesell(trade_id)
+            self._send_msg('Forcesell Result: `{result}`'.format(**msg))
+
+        except RPCException as e:
+            self._send_msg(str(e))
+
+    @authorized_only
+    def _forcebuy(self, update: Update, context: CallbackContext) -> None:
+        """
+        Handler for /forcebuy <asset> <price>.
+        Buys a pair trade at the given or current price
+        :param bot: telegram bot
+        :param update: message update
+        :return: None
+        """
+
+        pair = context.args[0]
+        price = float(context.args[1]) if len(context.args) > 1 else None
+        try:
+            self._rpc_forcebuy(pair, price)
+        except RPCException as e:
+            self._send_msg(str(e))
+
+    @authorized_only
+    def _performance(self, update: Update, context: CallbackContext) -> None:
+        """
+        Handler for /performance.
+        Shows a performance statistic from finished trades
+        :param bot: telegram bot
+        :param update: message update
+        :return: None
+        """
+        try:
+            trades = self._rpc_performance()
+            stats = '\n'.join('{index}.\t<code>{pair}\t{profit:.2f}% ({count})</code>'.format(
+                index=i + 1,
+                pair=trade['pair'],
+                profit=trade['profit'],
+                count=trade['count']
+            ) for i, trade in enumerate(trades))
+            message = '<b>Performance:</b>\n{}'.format(stats)
+            self._send_msg(message, parse_mode=ParseMode.HTML)
+        except RPCException as e:
+            self._send_msg(str(e))
+
+    @authorized_only
+    def _count(self, update: Update, context: CallbackContext) -> None:
+        """
+        Handler for /count.
+        Returns the number of trades running
+        :param bot: telegram bot
+        :param update: message update
+        :return: None
+        """
+        try:
+            counts = self._rpc_count()
+            message = tabulate({k: [v] for k, v in counts.items()},
+                               headers=['current', 'max', 'total stake'],
+                               tablefmt='simple')
+            message = "<pre>{}</pre>".format(message)
+            logger.debug(message)
+            self._send_msg(message, parse_mode=ParseMode.HTML)
+        except RPCException as e:
+            self._send_msg(str(e))
+
+    @authorized_only
+    def _whitelist(self, update: Update, context: CallbackContext) -> None:
+        """
+        Handler for /whitelist
+        Shows the currently active whitelist
+        """
+        try:
+            whitelist = self._rpc_whitelist()
+
+            message = f"Using whitelist `{whitelist['method']}` with {whitelist['length']} pairs\n"
+            message += f"`{', '.join(whitelist['whitelist'])}`"
+
+            logger.debug(message)
+            self._send_msg(message)
+        except RPCException as e:
+            self._send_msg(str(e))
+
+    @authorized_only
+    def _blacklist(self, update: Update, context: CallbackContext) -> None:
+        """
+        Handler for /blacklist
+        Shows the currently active blacklist
+        """
+        try:
+
+            blacklist = self._rpc_blacklist(context.args)
+
+            message = f"Blacklist contains {blacklist['length']} pairs\n"
+            message += f"`{', '.join(blacklist['blacklist'])}`"
+
+            logger.debug(message)
+            self._send_msg(message)
+        except RPCException as e:
+            self._send_msg(str(e))
+
+    @authorized_only
+    def _edge(self, update: Update, context: CallbackContext) -> None:
+        """
+        Handler for /edge
+        Shows information related to Edge
+        """
+        try:
+            edge_pairs = self._rpc_edge()
+            edge_pairs_tab = tabulate(edge_pairs, headers='keys', tablefmt='simple')
+            message = f'<b>Edge only validated following pairs:</b>\n<pre>{edge_pairs_tab}</pre>'
+            self._send_msg(message, parse_mode=ParseMode.HTML)
+        except RPCException as e:
+            self._send_msg(str(e))
+
+    @authorized_only
+    def _help(self, update: Update, context: CallbackContext) -> None:
+        """
+        Handler for /help.
+        Show commands of the bot
+        :param bot: telegram bot
+        :param update: message update
+        :return: None
+        """
+        forcebuy_text = "*/forcebuy <pair> [<rate>]:* `Instantly buys the given pair. " \
+                        "Optionally takes a rate at which to buy.` \n"
+        message = "*/start:* `Starts the trader`\n" \
+                  "*/stop:* `Stops the trader`\n" \
+                  "*/status [table]:* `Lists all open trades`\n" \
+                  "         *table :* `will display trades in a table`\n" \
+                  "*/profit:* `Lists cumulative profit from all finished trades`\n" \
+                  "*/forcesell <trade_id>|all:* `Instantly sells the given trade or all trades, " \
+                  "regardless of profit`\n" \
+                  f"{forcebuy_text if self._config.get('forcebuy_enable', False) else '' }" \
+                  "*/performance:* `Show performance of each finished trade grouped by pair`\n" \
+                  "*/daily <n>:* `Shows profit or loss per day, over the last n days`\n" \
+                  "*/count:* `Show number of trades running compared to allowed number of trades`" \
+                  "\n" \
+                  "*/balance:* `Show account balance per currency`\n" \
+                  "*/stopbuy:* `Stops buying, but handles open trades gracefully` \n" \
+                  "*/reload_conf:* `Reload configuration file` \n" \
+                  "*/whitelist:* `Show current whitelist` \n" \
+                  "*/blacklist [pair]:* `Show current blacklist, or adds one or more pairs " \
+                  "to the blacklist.` \n" \
+                  "*/edge:* `Shows validated pairs by Edge if it is enabeld` \n" \
+                  "*/help:* `This help message`\n" \
+                  "*/version:* `Show version`"
+
+        self._send_msg(message)
+
+    @authorized_only
+    def _version(self, update: Update, context: CallbackContext) -> None:
+        """
+        Handler for /version.
+        Show version information
+        :param bot: telegram bot
+        :param update: message update
+        :return: None
+        """
+        self._send_msg('*Version:* `{}`'.format(__version__))
+
+    def _send_msg(self, msg: str, parse_mode: ParseMode = ParseMode.MARKDOWN) -> None:
+        """
+        Send given markdown message
+        :param msg: message
+        :param bot: alternative bot
+        :param parse_mode: telegram parse mode
+        :return: None
+        """
+
+        keyboard = [['/daily', '/profit', '/balance'],
+                    ['/status', '/status table', '/performance'],
+                    ['/count', '/start', '/stop', '/help']]
+
+        reply_markup = ReplyKeyboardMarkup(keyboard)
+
+        try:
+            try:
+                self._updater.bot.send_message(
+                    self._config['telegram']['chat_id'],
+                    text=msg,
+                    parse_mode=parse_mode,
+                    reply_markup=reply_markup
+                )
+            except NetworkError as network_err:
+                # Sometimes the telegram server resets the current connection,
+                # if this is the case we send the message again.
+                logger.warning(
+                    'Telegram NetworkError: %s! Trying one more time.',
+                    network_err.message
+                )
+                self._updater.bot.send_message(
+                    self._config['telegram']['chat_id'],
+                    text=msg,
+                    parse_mode=parse_mode,
+                    reply_markup=reply_markup
+                )
+        except TelegramError as telegram_err:
             logger.warning(
-                'Got Telegram NetworkError: %s! Trying one more time.',
-                network_err.message
+                'TelegramError: %s! Giving up on that message.',
+                telegram_err.message
             )
-            bot.send_message(
-                _CONF['telegram']['chat_id'], msg,
-                parse_mode=parse_mode, reply_markup=reply_markup
-            )
-    except TelegramError as telegram_err:
-        logger.warning('Got TelegramError: %s! Giving up on that message.', telegram_err.message)
